@@ -1,0 +1,293 @@
+# =============================================================================
+# DevSecOps security-gated pipeline (Python web application)
+# =============================================================================
+# Purpose: Run build + layered security controls in order, then deploy only when
+# every required gate succeeds. Critical/high findings fail jobs (exit non-zero),
+# which fails the pipeline and blocks merge when branch protection requires
+# "Pipelines must succeed" (or equivalent).
+#
+# Prerequisites (repository):
+#   - requirements.txt (and ideally a lockfile: pip-tools, Poetry, or uv lock)
+#   - Dockerfile that EXPOSEs APP_PORT and runs your WSGI/ASGI server on 0.0.0.0
+#   - Optional: .trivyignore for accepted risk with audit trail
+#
+# GitLab CI/CD variables to configure in the project or group:
+#   - CI_REGISTRY_* : used implicitly for docker login when pushing images (optional)
+#   - SONAR_*       : only if you switch SAST to SonarQube (see sast job comments)
+#
+# “Critical / high” gating (how each tool maps it):
+#   - Trivy (SCA + image): CRITICAL,HIGH severities via TRIVY_SEVERITY + exit-code 1.
+#   - Semgrep (SAST): --error fails on any rule match; narrow with --severity / rule packs.
+#   - TruffleHog: --fail on verified secrets (policy: treat as merge-blocking incidents).
+#   - ZAP baseline: non-zero exit on baseline “fail” class (tune with -c / -u rule packs).
+# =============================================================================
+
+workflow:
+  rules:
+    # Merge request pipelines, branch pushes (including feature branches), and tags.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  # Application listen port inside the container (must match Dockerfile EXPOSE/CMD).
+  APP_PORT: "8000"
+  # Trivy: treat CRITICAL and HIGH as release blockers (align with org policy).
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+  TRIVY_EXIT_CODE: "1"
+  TRIVY_NO_PROGRESS: "true"
+  TRIVY_DB_REPOSITORY: "ghcr.io/aquasecurity/trivy-db"
+  TRIVY_JAVA_DB_REPOSITORY: "ghcr.io/aquasecurity/trivy-java-db"
+  # Docker-in-Docker (container scan + DAST)
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: "tcp://docker:2375"
+  # ZAP baseline: fail the job if the baseline scan reports failure (exit 2).
+  # Warnings-only (exit 1) can still be tuned; we keep default strict behavior.
+  ZAP_TARGET: "http://127.0.0.1:${APP_PORT}"
+
+stages:
+  - build
+  - sast
+  - sca
+  - secrets
+  - container-scan
+  - dast
+  - deploy
+
+# -----------------------------------------------------------------------------
+# Cache: speeds up repeated pip installs across jobs in the same branch.
+# -----------------------------------------------------------------------------
+cache:
+  key:
+    files:
+      - requirements.txt
+  paths:
+    - .cache/pip/
+
+# =============================================================================
+# 1. BUILD — install dependencies, validate bytecode compilation
+# =============================================================================
+# What: Creates a virtualenv, installs Python dependencies, runs compileall.
+# Why: Ensures dependencies resolve reproducibly and the tree is syntactically valid
+#      before spending time on security scanners.
+# Blocks: Unpinned/broken installs, syntax errors, missing modules at install time.
+# =============================================================================
+build:
+  stage: build
+  image: python:3.12-slim-bookworm
+  before_script:
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - pip install --upgrade pip setuptools wheel
+  script:
+    - pip install -r requirements.txt
+    # Optional: add your test suite here (pytest) as a quality gate before security.
+    - python -m compileall -q -f .
+  artifacts:
+    name: "python-venv-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - .venv/
+    expire_in: 1 day
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# 2. SAST — static application security testing (Semgrep)
+# =============================================================================
+# What: Semgrep with curated rulesets (security-audit + Python) against first-party code.
+# Why: Finds bug classes (injection, auth mistakes, dangerous APIs) without running the app.
+# Blocks: Findings at or above the configured severity when --error is set (policy below).
+#
+# Alternative (SonarQube): Requires a SonarQube server or SonarCloud + SONAR_TOKEN,
+# sonar-project.properties, and replacing this job with sonar-scanner. Semgrep is chosen
+# here because it is self-contained in CI (no external scanner VM).
+# =============================================================================
+sast:semgrep:
+  stage: sast
+  image:
+    name: semgrep/semgrep:1.99.0
+    entrypoint: [""]
+  needs: ["build"]
+  script:
+    # --error: non-zero exit if any finding matches (fails pipeline). Tune with
+    # --severity or rule packs if you must allow low-noise findings without blocking.
+    - >
+      semgrep ci
+      --config=p/security-audit
+      --config=p/python
+      --error
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# 3. SCA — software composition analysis (Trivy on filesystem / lockfiles)
+# =============================================================================
+# What: Trivy scans the repo for manifest/lockfiles (requirements.txt, Poetry, etc.)
+#       and matches dependencies against the vulnerability DB.
+# Why: Most CVEs enter through third-party packages; this gates known-vulnerable deps.
+# Blocks: CRITICAL/HIGH CVEs in dependencies (per TRIVY_SEVERITY / exit code).
+#
+# Tip: Commit a lockfile and prefer `trivy fs --dependency-tree` in reporting jobs
+#      for developer experience; keep this job as the hard gate.
+# =============================================================================
+sca:trivy-fs:
+  stage: sca
+  image:
+    name: aquasec/trivy:0.58.1
+    entrypoint: [""]
+  needs: ["build"]
+  script:
+    - trivy fs --scanners vuln --severity "$TRIVY_SEVERITY" --exit-code "$TRIVY_EXIT_CODE" .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# 4. SECRETS — leaked credentials / high-entropy secrets in history and tree
+# =============================================================================
+# What: TruffleHog scans the working tree for verified secrets (supported providers).
+# Why: Prevents credential sprawl and supply-chain leakage into VCS and artifacts.
+# Blocks: Verified secret findings (--fail). Tune with allowlists in code review policy.
+#
+# Alternative: Yelp detect-secrets with a baseline file for incremental enforcement.
+# =============================================================================
+secrets:trufflehog:
+  stage: secrets
+  image:
+    name: trufflesecurity/trufflehog:3.88.0
+    entrypoint: [""]
+  needs: ["build"]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    # Scan current checkout. In production, also scan full git history on default branch
+    # or use `trufflehog git file://$CI_PROJECT_DIR --since-commit ...` as policy dictates.
+    - trufflehog filesystem "$CI_PROJECT_DIR" --only-verified --fail
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# 5. CONTAINER SCAN — build image, scan OS + app libs with Trivy
+# =============================================================================
+# What: docker build then `trivy image` on the resulting image.
+# Why: Catches distro CVEs and packages baked into layers, not only repo manifests.
+# Blocks: CRITICAL/HIGH in the final runnable artifact (image).
+# Requires: Docker-in-Docker runner (privileged executor) or a remote Docker host.
+# =============================================================================
+container-scan:trivy-image:
+  stage: container-scan
+  image: docker:27.3.1-cli
+  services:
+    - name: docker:27.3.1-dind
+      command: ["--tls=false"]
+  needs: ["build"]
+  before_script:
+    - apk add --no-cache curl
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        sleep 1
+      done
+    - |
+      curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh" | sh -s -- -b /usr/local/bin v0.58.1
+  script:
+    - docker build -t "$CI_PROJECT_NAME:$CI_COMMIT_SHA" .
+    - trivy image --severity "$TRIVY_SEVERITY" --exit-code "$TRIVY_EXIT_CODE" "$CI_PROJECT_NAME:$CI_COMMIT_SHA"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# =============================================================================
+# 6. DAST — OWASP ZAP baseline against a running instance
+# =============================================================================
+# What: Builds the app image, runs it, attaches ZAP baseline in network namespace.
+# Why: Finds runtime issues (headers, cookies, passive findings) not visible to SAST alone.
+# Blocks: ZAP baseline failure exit code (typically 2) — tune with ZAP configs/rules.
+#
+# Rule: Only on merge requests targeting the default branch (e.g. main) — shifts slow/noisy
+#       scans to pre-merge review without blocking every feature branch push.
+# =============================================================================
+dast:zap-baseline:
+  stage: dast
+  image: docker:27.3.1-cli
+  services:
+    - name: docker:27.3.1-dind
+      command: ["--tls=false"]
+  needs: ["container-scan:trivy-image"]
+  before_script:
+    - apk add --no-cache bash curl
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        sleep 1
+      done
+  script:
+    - docker build -t "$CI_PROJECT_NAME:$CI_COMMIT_SHA" .
+    - docker rm -f zap-target 2>/dev/null || true
+    - docker run -d --name zap-target "$CI_PROJECT_NAME:$CI_COMMIT_SHA"
+    - |
+      echo "Waiting for HTTP listener on ${APP_PORT}..."
+      for i in $(seq 1 60); do
+        if docker exec zap-target python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${APP_PORT}/')" 2>/dev/null; then
+          echo "Target is up."
+          break
+        fi
+        sleep 2
+      done
+    # Share network namespace so ZAP hits the app on localhost inside the target container.
+    # Mount the project dir so the JSON report is written to the job workspace for artifacts.
+    - |
+      docker run --rm --network container:zap-target \
+        -v "$CI_PROJECT_DIR:/zap/wrk" \
+        owasp/zap2docker-stable:2.14.0 \
+        zap-baseline.py -t "$ZAP_TARGET" -J /zap/wrk/zap-report.json
+  artifacts:
+    when: always
+    paths:
+      - zap-report.json
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# 7. DEPLOY — only after all gates; not on merge request pipelines
+# =============================================================================
+# What: Placeholder deploy — replace with your orchestrator (Kubernetes, ECS, VM, etc.).
+# Why: Ensures release only from a clean, merged mainline (or tag) pipeline.
+# Blocks: This job does not run until prior required stages pass. DAST is optional in
+#         `needs` so pipelines without DAST (non-MR-to-main) still deploy when appropriate.
+#
+# Policy: Critical/high blocking is enforced in scanner jobs (Trivy, Semgrep, ZAP, TruffleHog).
+# =============================================================================
+deploy:production:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - job: build
+    - job: sast:semgrep
+    - job: sca:trivy-fs
+    - job: secrets:trufflehog
+    - job: container-scan:trivy-image
+    - job: dast:zap-baseline
+      optional: true
+  environment:
+    name: production
+    # url: https://app.example.com
+  script:
+    - echo "All security gates passed. Replace this with kubectl/helm/terraform/ansible/etc."
+    - 'test -n "${CI_COMMIT_SHA}"'
+  rules:
+    # Deploy from the default branch after merge, not from merge request pipelines.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"
+    - if: $CI_COMMIT_TAG
