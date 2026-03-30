@@ -1,4 +1,4 @@
-# devsecops-pipeline-demo
+# DevSecOps Pipeline Demo
 
 This repository is a small Python Flask application plus a **GitLab CI/CD** pipeline that runs a full security-gated delivery path: static analysis, dependency and container scanning, secret detection, and dynamic testing before anything is treated as releasable. It exists to show how those controls chain together in one place, with realistic tooling choices and fail-fast behavior you can point auditors or new engineers at without wading through a proprietary monorepo.
 
