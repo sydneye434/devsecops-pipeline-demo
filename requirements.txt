@@ -1,0 +1,12 @@
+# Demo app dependencies — pinned for reproducible pipeline scans.
+#
+# INTENTIONAL DEMO VULNERABILITY (SCA):
+# urllib3 1.26.x is below 2.0.7 and is associated with published CVEs (e.g. CVE-2023-45803).
+# Trivy and similar tools should report this when scanning requirements / the built image.
+# Remove or upgrade to urllib3>=2.0.7 in a real project.
+
+flask==3.0.3
+gunicorn==22.0.0
+requests==2.31.0
+sqlalchemy==2.0.30
+urllib3==1.26.4

@@ -1,0 +1,9 @@
+.git
+.gitignore
+.gitlab-ci.yml
+.venv
+__pycache__
+*.pyc
+demo.db
+.env
+*.md
